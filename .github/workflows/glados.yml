@@ -37,6 +37,7 @@ jobs:
         run: python checkin.py
         env:
           COOKIES: ${{ secrets.COOKIES }}
+          GLADOS_BASE_URL: ${{ secrets.GLADOS_BASE_URL }}
           SENDKEY: ${{ secrets.SENDKEY }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}

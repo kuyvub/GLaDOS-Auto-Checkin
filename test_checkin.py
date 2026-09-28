@@ -86,6 +86,53 @@ class CookieCompatibilityTests(unittest.TestCase):
         )
         self.assertEqual(2, len(checkin.split_cookie_accounts(raw)))
 
+    def test_accepts_only_supported_https_base_urls(self):
+        self.assertEqual(
+            "https://glados.space",
+            checkin.normalize_base_url("https://glados.space/"),
+        )
+        with self.assertRaises(ValueError):
+            checkin.normalize_base_url("https://example.com")
+        with self.assertRaises(ValueError):
+            checkin.normalize_base_url("http://glados.cloud")
+
+    def test_unauthorized_status_stops_before_checkin(self):
+        session = cast(
+            requests.Session,
+            types.SimpleNamespace(cookies=types.SimpleNamespace(clear=lambda: None)),
+        )
+        with mock.patch.object(
+            checkin,
+            "api_get",
+            return_value={"code": -2, "message": "没有权限"},
+        ), mock.patch.object(checkin, "checkin_request") as request:
+            result = checkin.checkin_account(
+                session,
+                "gld:sess=current; gld:sess.sig=current-signature",
+                1,
+            )
+
+        request.assert_not_called()
+        self.assertEqual("fail", result["result"])
+        self.assertIn("Cookie认证失败", result["status"])
+
+    def test_exchange_uses_official_json_request_format(self):
+        response = mock.Mock()
+        response.json.return_value = {"code": 0, "message": "ok"}
+        session = mock.Mock()
+        session.post.return_value = response
+        headers = {"cookie": "gld:sess=current"}
+
+        result = checkin.exchange_request(session, headers, "plan100")
+
+        self.assertEqual(0, result["code"])
+        session.post.assert_called_once_with(
+            checkin.EXCHANGE_URL,
+            headers=headers,
+            json={"planType": "plan100"},
+            timeout=checkin.TIMEOUT,
+        )
+
     def test_request_keeps_complete_transition_cookie(self):
         raw = (
             '"Cookie: __stripe_mid=unrelated; '

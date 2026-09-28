@@ -42,9 +42,9 @@
 
 ### 第二步：获取 GLaDOS Cookie
 
-1. 打开浏览器，登录 https://glados.cloud
+1. 打开浏览器，登录你实际使用的 GLaDOS 官方站点（默认 https://glados.cloud）
 2. 按 **F12** 打开开发者工具
-3. 打开 **Network（网络）**，刷新页面并选中任意发往 `glados.cloud` 的请求
+3. 打开 **Network（网络）**，刷新页面并选中任意发往当前 GLaDOS 站点的请求
 4. 在 **Request Headers（请求标头）** 中复制完整的 `Cookie` 值
 
 新版示例（值已省略）：
@@ -74,6 +74,11 @@ __stripe_mid=...; koa:sess=...; koa:sess.sig=...; gld:sess=...; gld:sess.sig=...
    - **Name**：`COOKIES`
    - **Value**：粘贴刚才复制的 Cookie
 4. 点击 **Save**
+
+Cookie 只能用于它所属的站点。若 Cookie 不是从 `https://glados.cloud` 获取，
+请再添加 Secret `GLADOS_BASE_URL`，值为复制 Cookie 时浏览器地址栏中的站点，
+例如 `https://glados.space`。脚本只接受已知的 GLaDOS 官方 HTTPS 域名，
+不会把 Cookie 发送到其它站点。
 
 ---
 
@@ -155,6 +160,12 @@ cookie_账号3
 **Q: 签到提示 Cookie 失效？**
 
 A: Cookie 有有效期，请重新登录获取最新 Cookie 并更新 Secrets。
+
+**Q: 签到提示“没有权限”或“Cookie 认证失败”？**
+
+A: 这不是 GitHub Actions 仓库权限问题，而是 GLaDOS 没有识别登录会话。请从
+Network 请求头重新复制完整 Cookie；若 Cookie 来自非 `glados.cloud` 官方站点，
+同时将 `GLADOS_BASE_URL` 设置为该站点。Cookie 与站点必须一致。
 
 **Q: Actions 被暂停了？**
 

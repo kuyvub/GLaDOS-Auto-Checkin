@@ -25,22 +25,56 @@ logging.basicConfig(
 logger = logging.getLogger("GLaDOS")
 
 # ==================== 配置 ====================
-CHECKIN_URL = "https://glados.cloud/api/user/checkin"
-STATUS_URL = "https://glados.cloud/api/user/status"
-POINTS_URL = "https://glados.cloud/api/user/points"
-EXCHANGE_URL = "https://glados.cloud/api/user/exchange"
+DEFAULT_BASE_URL = "https://glados.cloud"
+SUPPORTED_GLADOS_HOSTS = {
+    "glados.network",
+    "glados.rocks",
+    "glados.one",
+    "glados.space",
+    "glados.cloud",
+    "glados.vip",
+    "glados-facility.com",
+}
+
+
+def normalize_base_url(value: str) -> str:
+    """校验 GLaDOS 站点，防止把 Cookie 发送到非官方域名。"""
+    value = (value or DEFAULT_BASE_URL).strip().rstrip("/")
+    parsed = urllib.parse.urlparse(value)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in SUPPORTED_GLADOS_HOSTS
+        or parsed.path not in ("", "/")
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("GLADOS_BASE_URL 必须是受支持的 GLaDOS HTTPS 站点")
+    return f"https://{parsed.hostname}"
+
+
+try:
+    BASE_URL = normalize_base_url(os.getenv("GLADOS_BASE_URL", ""))
+except ValueError as exc:
+    logger.warning("%s；已回退到 %s", exc, DEFAULT_BASE_URL)
+    BASE_URL = DEFAULT_BASE_URL
+
+API_URL = f"{BASE_URL}/api/user"
+CHECKIN_URL = f"{API_URL}/checkin"
+STATUS_URL = f"{API_URL}/status"
+POINTS_URL = f"{API_URL}/points"
+EXCHANGE_URL = f"{API_URL}/exchange"
 HEADERS_BASE = {
-    "origin": "https://glados.cloud",
-    "referer": "https://glados.cloud/console/checkin",
+    "accept": "application/json, text/plain, */*",
+    "origin": BASE_URL,
+    "referer": f"{BASE_URL}/console/checkin",
     "user-agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
-    # 注意：使用 requests 的 json= 参数时会自动设置 Content-Type: application/json，
-    # 此处无需（也不应）手动设置 content-type，否则与 requests 默认行为重复。
 }
-PAYLOAD = {"token": "glados.cloud"}
+PAYLOAD = {"token": urllib.parse.urlparse(BASE_URL).hostname}
 TIMEOUT = (5, 15)  # (连接超时, 读取超时)
 MAX_RETRY = 3
 RETRY_MIN_WAIT = 2.0
@@ -77,7 +111,7 @@ def safe_json(resp: requests.Response) -> Dict[str, Any]:
     """安全解析 JSON 响应（用于推送等非关键路径，失败返回空字典）。"""
     try:
         return resp.json()
-    except (ValueError, requests.exceptions.JSONDecodeError):
+    except ValueError:
         return {}
 
 
@@ -111,6 +145,29 @@ def safe_int_str(val: Any, default: str = "-") -> str:
             return str(int(float(val)))
         except (TypeError, ValueError):
             return default
+
+
+AUTH_ERROR_KEYWORDS = (
+    "没有权限",
+    "权限不足",
+    "unauthorized",
+    "not authorized",
+    "permission denied",
+    "please login",
+)
+
+
+def authentication_error(payload: Dict[str, Any]) -> Optional[str]:
+    """返回明确的登录态错误；非鉴权错误返回 ``None``。"""
+    message = str(payload.get("message") or payload.get("msg") or "").strip()
+    message_lower = message.lower()
+    try:
+        code = int(payload.get("code"))
+    except (TypeError, ValueError):
+        code = None
+    if code in (401, 403) or any(keyword in message_lower for keyword in AUTH_ERROR_KEYWORDS):
+        return message or "未登录"
+    return None
 
 
 def mask_email(email: str) -> str:
@@ -307,21 +364,20 @@ def _push_request(
     *,
     json_payload: Optional[Dict[str, Any]] = None,
     data_payload: Optional[Dict[str, Any]] = None,
-    headers: Optional[Dict[str, str]] = None,
-    success_check: Callable[[Dict[str, Any], requests.Response], bool],
+    success_check: Callable[[Dict[str, Any]], bool],
     fail_msg_keys: Tuple[str, ...] = ("message",),
 ) -> bool:
     """通用推送请求函数，返回是否推送成功（M4：失败响应截断后记录）。"""
     try:
         if json_payload is not None:
-            r = requests.post(url, json=json_payload, headers=headers, timeout=TIMEOUT)
+            r = requests.post(url, json=json_payload, timeout=TIMEOUT)
         else:
-            r = requests.post(url, data=data_payload, headers=headers, timeout=TIMEOUT)
+            r = requests.post(url, data=data_payload, timeout=TIMEOUT)
         if not r.ok:
             logger.warning("%s 推送失败: HTTP %d", name, r.status_code)
             return False
         resp = safe_json(r)
-        if success_check(resp, r):
+        if success_check(resp):
             logger.info("%s 推送成功", name)
             return True
         fail_msg = r.text
@@ -347,7 +403,7 @@ def push_deer(key: str, title: str, content: str) -> bool:
         "PushDeer",
         "https://api2.pushdeer.com/message/push",
         json_payload={"pushkey": key, "text": f"{title}\n\n{content}", "type": "text"},
-        success_check=lambda resp, r: r.ok and resp.get("code") == 0,
+        success_check=lambda resp: resp.get("code") == 0,
         fail_msg_keys=("message",),
     )
 
@@ -360,7 +416,7 @@ def push_serverchan(key: str, title: str, content: str) -> bool:
         "Server酱",
         f"https://sctapi.ftqq.com/{key}.send",
         data_payload={"title": title, "desp": content},
-        success_check=lambda resp, r: r.ok and resp.get("code") == 0,
+        success_check=lambda resp: resp.get("code") == 0,
         fail_msg_keys=("message",),
     )
 
@@ -376,7 +432,7 @@ def push_telegram(bot_token: str, chat_id: str, title: str, content: str) -> boo
         "Telegram",
         f"https://api.telegram.org/bot{bot_token}/sendMessage",
         json_payload={"chat_id": chat_id, "text": text},
-        success_check=lambda resp, r: bool(r.ok and resp.get("ok")),
+        success_check=lambda resp: bool(resp.get("ok")),
         fail_msg_keys=("description",),
     )
 
@@ -389,7 +445,7 @@ def push_pushplus(token: str, title: str, content: str) -> bool:
         "PushPlus",
         "https://www.pushplus.plus/send",
         json_payload={"token": token, "title": title, "content": content, "template": "html"},
-        success_check=lambda resp, r: r.ok and resp.get("code") == 200,
+        success_check=lambda resp: resp.get("code") == 200,
         fail_msg_keys=("msg",),
     )
 
@@ -424,8 +480,7 @@ def push_dingtalk(webhook_url: str, title: str, content: str) -> bool:
             "msgtype": "markdown",
             "markdown": {"title": _escape_markdown(title), "text": f"### {_escape_markdown(title)}\n\n{_escape_markdown(content)}"},
         },
-        headers={"Content-Type": "application/json"},
-        success_check=lambda resp, r: r.ok and resp.get("errcode") == 0,
+        success_check=lambda resp: resp.get("errcode") == 0,
         fail_msg_keys=("errmsg",),
     )
 
@@ -469,8 +524,7 @@ def push_feishu(webhook_url: str, title: str, content: str) -> bool:
         "飞书机器人",
         webhook_url,
         json_payload=data,
-        headers={"Content-Type": "application/json"},
-        success_check=lambda resp, r: r.ok and resp.get("code") == 0,
+        success_check=lambda resp: resp.get("code") == 0,
         fail_msg_keys=("msg",),
     )
 
@@ -486,8 +540,7 @@ def push_wecom_bot(webhook_url: str, title: str, content: str) -> bool:
             "msgtype": "markdown",
             "markdown": {"content": f"### {_escape_markdown(title)}\n\n{_escape_markdown(content)}"},
         },
-        headers={"Content-Type": "application/json"},
-        success_check=lambda resp, r: r.ok and resp.get("errcode") == 0,
+        success_check=lambda resp: resp.get("errcode") == 0,
         fail_msg_keys=("errmsg",),
     )
 
@@ -510,8 +563,7 @@ def push_yunhu(token: str, recv_id: str, title: str, content: str) -> bool:
             "contentType": 1,
             "content": f"**{title}**\n\n{content}",
         },
-        headers={"Content-Type": "application/json"},
-        success_check=lambda resp, r: r.ok and resp.get("code") == 1,
+        success_check=lambda resp: resp.get("code") == 1,
         fail_msg_keys=("msg", "message"),
     )
 
@@ -606,14 +658,14 @@ def exchange_request(session: requests.Session, headers: Dict[str, str], plan: s
     """
     执行积分兑换请求（#9 功能请求）。
 
-    GLaDOS 兑换接口以表单形式提交 planType（plan100/plan200/plan500），
+    GLaDOS 兑换接口以 JSON 提交 planType（plan100/plan200/plan500），
     响应 JSON 中 code==0 表示兑换成功。
 
     注意：故意不加 @retry_on_failure —— 兑换是消耗积分的非幂等 POST，
     若首次请求服务端已成功但响应丢失（读超时/连接重置），重试会导致重复扣积分。
     失败仅记警告、不影响签到结果与退出码，无需重试兜底。
     """
-    r = session.post(EXCHANGE_URL, headers=headers, data={"planType": plan}, timeout=TIMEOUT)
+    r = session.post(EXCHANGE_URL, headers=headers, json={"planType": plan}, timeout=TIMEOUT)
     r.raise_for_status()
     return require_json(r)
 
@@ -644,11 +696,24 @@ def checkin_account(
     exchange_status = "-"  # 兑换结果描述（未配置时保持 "-"，不输出到日志）
 
     try:
+        # 先验证登录态。Cookie 字段齐全不代表会话仍有效；未登录时直接请求
+        # 签到只会得到笼统的“没有权限”，容易被误认为 GitHub 权限问题。
+        s = api_get(session, STATUS_URL, headers)
+        auth_error = authentication_error(s)
+        if auth_error:
+            raise PermissionError(auth_error)
+        data = s.get("data") or {}
+        email = data.get("email", email)
+        if data.get("leftDays") is not None:
+            days = f"{safe_int_str(data['leftDays'])} 天"
+
         # 1. 签到
         j = checkin_request(session, headers)
+        auth_error = authentication_error(j)
+        if auth_error:
+            raise PermissionError(auth_error)
         code = j.get("code", -2)
         message = j.get("message", "")
-        # H1：GLaDOS 不返回 points 字段，从 message 文本解析本次获得积分
         earned = parse_earned_points(message)
         result = classify_checkin(code, message)
 
@@ -659,19 +724,12 @@ def checkin_account(
         else:
             status = f"❌ 失败({message})"
 
-        # 2. 查询账号状态（剩余天数、邮箱）
-        try:
-            s = api_get(session, STATUS_URL, headers)
-            data = s.get("data") or {}
-            email = data.get("email", email)
-            if data.get("leftDays") is not None:
-                days = f"{safe_int_str(data['leftDays'])} 天"
-        except Exception as e:  # noqa: BLE001
-            logger.warning("账号 %d 状态查询失败: %s", index, e)
-
-        # 3. 查询总积分（兼容顶层 points 与 data.points 两种返回结构，#1）
+        # 2. 查询总积分（兼容顶层 points 与 data.points 两种返回结构）
         try:
             p = api_get(session, POINTS_URL, headers)
+            points_auth_error = authentication_error(p)
+            if points_auth_error:
+                raise PermissionError(points_auth_error)
             pts = p.get("points")
             if pts is None:
                 pts = (p.get("data") or {}).get("points")
@@ -681,6 +739,8 @@ def checkin_account(
                     total_points_int = int(float(pts))
                 except (TypeError, ValueError):
                     total_points_int = None
+            else:
+                logger.warning("账号 %d 积分响应缺少 points: %s", index, p.get("message", "未知响应"))
         except requests.exceptions.HTTPError as e:
             resp = getattr(e, "response", None)
             status_code = getattr(resp, "status_code", "?") if resp is not None else "?"
@@ -688,7 +748,7 @@ def checkin_account(
         except Exception as e:  # noqa: BLE001
             logger.warning("账号 %d 积分查询失败: %s", index, e)
 
-        # 4. 积分兑换（#9，仅配置了 EXCHANGE_PLAN 时执行；默认关闭不影响现有功能）
+        # 3. 积分兑换（仅配置了 EXCHANGE_PLAN 时执行；默认关闭不影响现有功能）
         #    兑换独立于签到结果，但仅在成功查到积分后尝试；失败不影响签到状态/退出码。
         if exchange_plan and exchange_plan in EXCHANGE_PLANS:
             req_pts = EXCHANGE_PLANS[exchange_plan]["points"]
@@ -717,6 +777,16 @@ def checkin_account(
                     exchange_status = f"⚠️ 兑换异常({type(e).__name__})"
                     logger.warning("账号 %d 积分兑换异常: %s", index, e)
 
+    except PermissionError as e:
+        logger.error(
+            "账号 %d Cookie 认证失败（%s）。请重新登录 %s 后从 Network 请求头复制完整 Cookie；"
+            "若 Cookie 来自其它官方站点，请设置同站点的 GLADOS_BASE_URL。",
+            index,
+            e,
+            BASE_URL,
+        )
+        status = "❌ Cookie认证失败(已过期、复制不完整或站点不匹配)"
+        result = "fail"
     except Exception as e:  # noqa: BLE001
         logger.error("账号 %d 签到异常: %s", index, e)
         status = f"❌ 异常({type(e).__name__})"
