@@ -20,15 +20,18 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
       - name: Install dependencies
         run: pip install "requests==2.32.3" --no-cache-dir
+
+      - name: Run tests
+        run: python -m unittest -v
 
       - name: Run checkin
         run: python checkin.py
@@ -64,7 +67,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 1
 

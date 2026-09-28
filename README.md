@@ -44,15 +44,23 @@
 
 1. 打开浏览器，登录 https://glados.cloud
 2. 按 **F12** 打开开发者工具
-3. 找到 `Application` → `Cookies` → `glados.cloud`
-4. 复制完整 Cookie 内容
+3. 打开 **Network（网络）**，刷新页面并选中任意发往 `glados.cloud` 的请求
+4. 在 **Request Headers（请求标头）** 中复制完整的 `Cookie` 值
 
-示例：
+新版示例（值已省略）：
 ```
-koa:sess=xxxxxx; koa:sess.sig=yyyyyy
+__stripe_mid=...; koa:sess=...; koa:sess.sig=...; gld:sess=...; gld:sess.sig=...
 ```
 
-⚠️ **必须是完整的一整段**
+脚本兼容以下三种情况：
+
+- 新版：`gld:sess` 与 `gld:sess.sig`
+- 旧版：`koa:sess` 与 `koa:sess.sig`
+- 迁移期：`gld:` 与 `koa:` 两组字段同时存在
+
+⚠️ **必须复制完整的一整段**。同一前缀的 `sess` 与 `sess.sig` 必须成对出现，
+不要手动改前缀或删除 `__stripe_mid` 等其它字段。若从 Network 的 Request Headers
+复制，可以粘贴纯值，也可以保留外围引号或 `Cookie:` 前缀，脚本会自动清理。
 
 ---
 

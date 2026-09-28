@@ -5,7 +5,6 @@ GLaDOS 自动签到脚本
 import os
 import re
 import sys
-import json
 import time
 import random
 import hashlib
@@ -52,6 +51,13 @@ TELEGRAM_MAX_LENGTH = 4000
 TELEGRAM_TRUNCATE_LENGTH = 3990
 CONTENT_MAX_LENGTH = 3000  # 推送汇总内容统一长度上限，避免超长导致部分渠道发送失败（#4）
 COOKIE_MASK_LENGTH = 10
+# GLaDOS 正在从 koa:sess 迁移到 gld:sess。浏览器可能只返回其中一组，
+# 也可能在迁移期同时返回两组；校验时需要兼容这三种情况。
+SESSION_COOKIE_PREFIXES = ("gld", "koa")
+COOKIE_FORMAT_HINT = (
+    "需要 gld:sess + gld:sess.sig（新版），或 "
+    "koa:sess + koa:sess.sig（旧版）"
+)
 # 前后各显示 10 个字符，因此长度必须 > 2*COOKIE_MASK_LENGTH + 3 = 23 才能安全脱敏，
 # 设为 24 可避免 len∈[21,23] 时前后片段重叠导致几乎暴露完整 Cookie（M3）。
 COOKIE_MIN_LENGTH = 24
@@ -168,17 +174,86 @@ def parse_earned_points(message: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def normalize_cookie(cookie: str) -> str:
+    """清理复制 Cookie 时常见的外围引号和 ``Cookie:`` 请求头前缀。"""
+    value = (cookie or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1].strip()
+    if value[:7].lower() == "cookie:":
+        value = value[7:].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1].strip()
+    return value
+
+
+def parse_cookie_values(cookie: str) -> Dict[str, str]:
+    """按 Cookie 语法解析键值；值中的 ``=`` 会被保留。"""
+    values: Dict[str, str] = {}
+    for part in normalize_cookie(cookie).split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        if key:
+            values[key] = value.strip()
+    return values
+
+
+def detect_session_prefixes(cookie: str) -> List[str]:
+    """返回 Cookie 中字段和值都完整的 GLaDOS 会话前缀。"""
+    values = parse_cookie_values(cookie)
+    return [
+        prefix
+        for prefix in SESSION_COOKIE_PREFIXES
+        if values.get(f"{prefix}:sess") and values.get(f"{prefix}:sess.sig")
+    ]
+
+
 def validate_cookie(cookie: str) -> Tuple[bool, str]:
-    """验证 Cookie 是否包含必要字段（按 ; 拆分 key 精确校验，避免子串误判）"""
-    if not cookie or not cookie.strip():
+    """兼容新版 gld 会话、旧版 koa 会话，以及迁移期两组并存的 Cookie。"""
+    normalized = normalize_cookie(cookie)
+    if not normalized:
         return False, "Cookie 为空"
-    cookie = cookie.strip()
-    keys = {part.split("=", 1)[0].strip() for part in cookie.split(";") if part.strip()}
-    if "koa:sess" not in keys:
-        return False, "Cookie 缺少必要字段: koa:sess"
-    if "koa:sess.sig" not in keys:
-        return False, "Cookie 缺少必要字段: koa:sess.sig"
-    return True, ""
+    if "\r" in normalized or "\n" in normalized:
+        return False, "Cookie 中包含换行，请为每个账号提供一整行 Cookie"
+
+    values = parse_cookie_values(normalized)
+
+    # 新版字段一旦出现，就必须成对且非空；避免 koa 旧会话尚在、gld 新会话
+    # 却复制不完整时被误判为可用。
+    has_gld_field = "gld:sess" in values or "gld:sess.sig" in values
+    if has_gld_field:
+        missing = [
+            key
+            for key in ("gld:sess", "gld:sess.sig")
+            if not values.get(key)
+        ]
+        if missing:
+            return False, f"Cookie 缺少或未填写必要字段: {', '.join(missing)}；{COOKIE_FORMAT_HINT}"
+        return True, ""
+
+    if values.get("koa:sess") and values.get("koa:sess.sig"):
+        return True, ""
+
+    missing = [
+        key
+        for key in ("koa:sess", "koa:sess.sig")
+        if not values.get(key)
+    ]
+    return False, f"Cookie 缺少或未填写必要字段: {', '.join(missing)}；{COOKIE_FORMAT_HINT}"
+
+
+def split_cookie_accounts(raw: str) -> List[str]:
+    """拆分多账号配置，并归一化每一段 Cookie。"""
+    return [
+        cookie
+        for cookie in (
+            normalize_cookie(part)
+            for part in re.split(r"\|\|\||[&\n]", raw or "")
+        )
+        if cookie
+    ]
 
 
 def is_retryable(exc: Exception) -> bool:
@@ -301,7 +376,7 @@ def push_telegram(bot_token: str, chat_id: str, title: str, content: str) -> boo
         "Telegram",
         f"https://api.telegram.org/bot{bot_token}/sendMessage",
         json_payload={"chat_id": chat_id, "text": text},
-        success_check=lambda resp, r: r.ok and resp.get("ok"),
+        success_check=lambda resp, r: bool(r.ok and resp.get("ok")),
         fail_msg_keys=("description",),
     )
 
@@ -555,7 +630,9 @@ def checkin_account(
     """
     session.cookies.clear()  # 清除上一个账号的残留 Cookie，避免串扰
     headers = {**HEADERS_BASE}
-    headers["cookie"] = cookie
+    # 保留浏览器复制出的全部 Cookie 字段，只清理外围格式；不能把 gld: 改成
+    # koa:，也不能丢掉迁移期并存的任意一组会话字段。
+    headers["cookie"] = normalize_cookie(cookie)
 
     email = "unknown"
     days = "-"
@@ -660,7 +737,7 @@ def checkin_account(
 def main() -> int:
     # H2：支持 ||| 或换行(\n)或 & 分隔多账号 Cookie；推荐使用 ||| 避免与 Cookie 值冲突
     raw = os.getenv("COOKIES", "")
-    cookies = [c.strip() for c in re.split(r"\|\|\||[&\n]", raw) if c.strip()]
+    cookies = split_cookie_accounts(raw)
 
     # #9：积分兑换计划（可选，默认关闭；仅显式配置且值合法时启用，避免静默消耗积分）
     raw_plan = (os.getenv("EXCHANGE_PLAN") or os.getenv("GLADOS_EXCHANGE_PLAN") or "").strip()
@@ -703,7 +780,11 @@ def main() -> int:
                     time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
                 continue
 
-            logger.info("正在处理账号 %d/%d...", idx, len(cookies))
+            prefixes = "+".join(detect_session_prefixes(cookie)) or "未知"
+            logger.info(
+                "正在处理账号 %d/%d... (Cookie 会话: %s)",
+                idx, len(cookies), prefixes,
+            )
             acc = checkin_account(session, cookie, idx, exchange_plan)
 
             if acc["result"] == "ok":
